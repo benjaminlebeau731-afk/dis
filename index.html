@@ -9,11 +9,13 @@
     <meta name="theme-color" content="#0f172a">
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { 
             getAuth, 
             signInAnonymously, 
+            signInWithCustomToken,
             onAuthStateChanged 
         } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
         import { 
@@ -24,18 +26,28 @@
             orderBy, 
             onSnapshot, 
             where, 
-            serverTimestamp,
-            limit
+            serverTimestamp, 
+            doc, 
+            setDoc, 
+            getDocs,
+            getDoc,
+            updateDoc,
+            arrayUnion,
+            limit,
+            Timestamp,
+            deleteDoc,
+            writeBatch
         } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
-        // --- Configuration (Restored API KEYS) ---
+        // --- Configuration ---
         const firebaseConfig = {
-            apiKey: "AIzaSyCcvTw7KMVqJJkAZ4yK6toa8D1JB0bzQ4E",
-            authDomain: "flutter-ai-playground-7d5a9.firebaseapp.com",
-            projectId: "flutter-ai-playground-7d5a9",
-            storageBucket: "flutter-ai-playground-7d5a9.firebasestorage.app",
-            messagingSenderId: "949538989426",
-            appId: "1:949538989426:web:28cac8ac61b5d91cc1a9eb"
+            apiKey: "AIzaSyAkW6DI0jCMkOJY8t_txCntd5MhRed443w",
+            authDomain: "d-multiplayer-37078.firebaseapp.com",
+            projectId: "d-multiplayer-37078",
+            storageBucket: "d-multiplayer-37078.firebasestorage.app",
+            messagingSenderId: "1032442419330",
+            appId: "1:1032442419330:web:cfd110e8442febf829bc9b",
+            measurementId: "G-7KC04NRGE5"
         };
 
         const app = initializeApp(firebaseConfig);
@@ -48,18 +60,22 @@
             user: null,
             username: localStorage.getItem('chat_username') || '', 
             discordWebhook: localStorage.getItem('discord_webhook') || '',
-            hasJoined: !!localStorage.getItem('chat_username'),
+            hasJoined: false,
+            activeTab: 'global',
             activeChatId: 'global',
+            activeChatName: 'Global Chat',
             isSidebarOpen: true,
             messages: [],
+            myChats: [],
             unsubscribes: [],
+            notificationsEnabled: true,
         };
 
         const root = document.getElementById('root');
 
         // --- Discord Logic ---
         async function sendToDiscord(text) {
-            if (!state.discordWebhook) return;
+            if (!state.discordWebhook || state.activeChatId !== 'global') return;
             try {
                 await fetch(state.discordWebhook, {
                     method: 'POST',
@@ -81,21 +97,31 @@
         };
 
         // --- Auth & Listeners ---
+        async function initAuth() {
+            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                await signInWithCustomToken(auth, __initial_auth_token);
+            } else {
+                await signInAnonymously(auth);
+            }
+        }
+
         onAuthStateChanged(auth, (user) => {
             state.user = user;
-            if (user && state.hasJoined) {
+            if (user && state.username) {
+                state.hasJoined = true;
                 setupListeners();
-            } else if (!user) {
-                signInAnonymously(auth);
             }
             render();
         });
+
+        initAuth();
 
         function setupListeners() {
             state.unsubscribes.forEach(unsub => unsub());
             state.unsubscribes = [];
             if (!state.user || !state.hasJoined) return;
 
+            // Listen for all messages in the current chat
             const msgsQuery = query(
                 collection(db, 'artifacts', appId, 'public', 'data', 'messages'), 
                 where('chatId', '==', state.activeChatId)
@@ -105,14 +131,32 @@
                 let msgs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
                 msgs.sort((a, b) => (a.createdAt?.seconds || 0) - (b.createdAt?.seconds || 0));
                 
+                // If the last message is from Discord and we didn't have it, play sound
+                if (msgs.length > state.messages.length) {
+                    const latest = msgs[msgs.length - 1];
+                    if (latest.platform === 'discord') {
+                        playNotificationSound();
+                    }
+                }
+                
                 state.messages = msgs;
                 renderMessages();
                 const container = document.getElementById('messages-container');
                 if (container) container.scrollTop = container.scrollHeight;
-            }, (error) => console.error("Listener Error:", error));
-            
+            });
             state.unsubscribes.push(unsubMsgs);
         }
+
+        const playNotificationSound = () => {
+            try {
+                const ctx = new AudioContext();
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.connect(gain); gain.connect(ctx.destination);
+                osc.frequency.value = 600; gain.gain.value = 0.1;
+                osc.start(); osc.stop(ctx.currentTime + 0.1);
+            } catch(e) {}
+        };
 
         // --- Actions ---
         window.handleJoin = (e) => {
@@ -137,10 +181,17 @@
                 uid: state.user.uid,
                 chatId: state.activeChatId,
                 senderName: state.username,
-                platform: 'web'
+                platform: 'web' // Identify this came from the web app
             });
 
             sendToDiscord(text);
+        };
+
+        window.switchChat = (id, name) => {
+            state.activeChatId = id;
+            state.activeChatName = name;
+            setupListeners();
+            render();
         };
 
         window.toggleSidebar = () => { state.isSidebarOpen = !state.isSidebarOpen; render(); };
@@ -149,16 +200,16 @@
 
         // --- Rendering ---
         function render() {
-            if (!state.user) { root.innerHTML = `<div class="h-screen bg-slate-950 flex items-center justify-center text-indigo-400">Connecting...</div>`; return; }
+            if (!state.user) { root.innerHTML = `<div class="h-screen bg-slate-950 flex items-center justify-center text-indigo-400">Booting Satellite...</div>`; return; }
             if (!state.hasJoined) {
                 root.innerHTML = `
                     <div class="h-screen flex items-center justify-center bg-[#0B0C15] p-6">
                         <div class="w-full max-w-md bg-[#15161E] p-8 rounded-[32px] border border-slate-800 shadow-2xl">
-                            <h1 class="text-3xl font-bold text-center mb-2 text-white italic tracking-tighter">CHAT SPACE</h1>
-                            <p class="text-slate-500 text-center mb-8 text-sm uppercase tracking-widest">Global Sync Enabled</p>
+                            <h1 class="text-3xl font-bold text-center mb-2 text-white italic">CHAT SPACE</h1>
+                            <p class="text-slate-500 text-center mb-8 text-sm">Enter the cross-platform void</p>
                             <form onsubmit="handleJoin(event)" class="space-y-6">
                                 <input id="username-input" type="text" class="w-full bg-black border border-slate-700 p-4 rounded-xl text-white outline-none focus:border-indigo-500" placeholder="Pick a username" required>
-                                <button class="w-full bg-indigo-600 hover:bg-indigo-500 p-4 rounded-xl font-bold text-white transition-colors uppercase">Initialize</button>
+                                <button class="w-full bg-indigo-600 hover:bg-indigo-500 p-4 rounded-xl font-bold text-white transition-colors">Launch</button>
                             </form>
                         </div>
                     </div>`;
@@ -167,18 +218,19 @@
 
             root.innerHTML = `
                 <div class="flex h-screen bg-[#08090F] text-slate-200 overflow-hidden font-sans">
+                    <!-- Sidebar -->
                     <div id="sidebar" class="${state.isSidebarOpen ? 'w-80 border-r' : 'w-0 border-r-0'} bg-[#0F111A] border-slate-800 flex flex-col transition-all duration-300 relative">
                         <div class="p-6 border-b border-slate-800 flex justify-between items-center">
                             <span class="font-black tracking-tighter text-xl italic text-indigo-400">CS.</span>
                             <button onclick="openDiscordModal()" class="bg-[#5865F2]/10 hover:bg-[#5865F2]/20 text-[#5865F2] px-3 py-1 rounded-full text-[10px] font-bold flex items-center gap-1 transition-all">
-                                <i data-lucide="message-square" class="w-3 h-3"></i> DISCORD LINK
+                                <i data-lucide="message-square" class="w-3 h-3"></i> DISCORD SYNC
                             </button>
                         </div>
                         <div class="p-4 space-y-2">
-                            <div class="w-full p-4 rounded-2xl flex items-center gap-3 bg-indigo-600 shadow-lg shadow-indigo-500/20 text-white">
+                            <button onclick="switchChat('global', 'Global Chat')" class="w-full p-4 rounded-2xl flex items-center gap-3 transition-all ${state.activeChatId === 'global' ? 'bg-indigo-600 shadow-lg shadow-indigo-500/20 text-white' : 'hover:bg-slate-800 text-slate-400'}">
                                 <i data-lucide="globe" class="w-5 h-5"></i>
                                 <span class="font-bold">Global Orbit</span>
-                            </div>
+                            </button>
                         </div>
                         <div class="mt-auto p-6 border-t border-slate-800 bg-black/20">
                             <div class="flex items-center gap-3">
@@ -187,12 +239,13 @@
                                 </div>
                                 <div class="flex flex-col">
                                     <span class="text-sm font-bold text-white">${state.username}</span>
-                                    <span class="text-[10px] text-green-500 uppercase tracking-widest font-bold">Encrypted Link</span>
+                                    <span class="text-[10px] text-slate-500 uppercase tracking-widest">Active Link</span>
                                 </div>
                             </div>
                         </div>
                     </div>
 
+                    <!-- Main Chat Area -->
                     <div class="flex-1 flex flex-col relative">
                         <header class="h-20 border-b border-slate-800 flex items-center justify-between px-8 bg-[#0F111A]/80 backdrop-blur-md z-10">
                             <div class="flex items-center">
@@ -200,21 +253,23 @@
                                     <i data-lucide="menu" class="w-5 h-5 text-slate-400"></i>
                                 </button>
                                 <div>
-                                    <h2 class="font-bold text-lg text-white">Global Chat</h2>
+                                    <h2 class="font-bold text-lg text-white">${state.activeChatName}</h2>
                                     <div class="flex items-center gap-2">
                                         <span class="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
-                                        <span class="text-[10px] text-slate-500 font-bold uppercase tracking-widest">Real-time History Restored</span>
+                                        <span class="text-[10px] text-slate-500 font-bold uppercase tracking-widest">System Online</span>
                                     </div>
                                 </div>
                             </div>
                         </header>
 
-                        <div id="messages-container" class="flex-1 overflow-y-auto p-8 space-y-6 scroll-smooth"></div>
+                        <div id="messages-container" class="flex-1 overflow-y-auto p-8 space-y-6 scroll-smooth">
+                            <!-- Messages injected here -->
+                        </div>
 
                         <div class="p-6 bg-[#0F111A]">
                             <form onsubmit="handleSendMessage(event)" class="relative max-w-4xl mx-auto">
-                                <input id="message-input" type="text" autocomplete="off" class="w-full bg-black border border-slate-800 p-5 pr-16 rounded-[24px] outline-none focus:border-indigo-500 transition-all text-sm placeholder-slate-600 shadow-2xl" placeholder="Send a global message...">
-                                <button class="absolute right-3 top-1/2 -translate-y-1/2 bg-indigo-600 hover:bg-indigo-500 w-12 h-12 rounded-full flex items-center justify-center transition-all">
+                                <input id="message-input" type="text" autocomplete="off" class="w-full bg-black border border-slate-800 p-5 pr-16 rounded-[24px] outline-none focus:border-indigo-500 transition-all text-sm placeholder-slate-600" placeholder="Type a message to the void...">
+                                <button class="absolute right-3 top-1/2 -translate-y-1/2 bg-indigo-600 hover:bg-indigo-500 w-12 h-12 rounded-full flex items-center justify-center transition-all shadow-lg shadow-indigo-600/20">
                                     <i data-lucide="arrow-up" class="w-5 h-5 text-white"></i>
                                 </button>
                             </form>
@@ -222,24 +277,39 @@
                     </div>
                 </div>
 
+                <!-- Discord Settings Modal -->
                 <div id="discord-modal" class="modal hidden fixed inset-0 z-50 flex items-center justify-center bg-black/90 backdrop-blur-sm p-4">
                     <div class="bg-[#15161E] border border-slate-800 w-full max-w-lg rounded-[32px] p-8 shadow-2xl">
                         <div class="flex items-center gap-3 mb-6">
                             <div class="p-3 bg-[#5865F2] rounded-2xl">
                                 <i data-lucide="message-square" class="text-white w-6 h-6"></i>
                             </div>
-                            <h3 class="text-2xl font-black italic text-white uppercase tracking-tighter">Discord Integration</h3>
+                            <h3 class="text-2xl font-black italic text-white">DISCORD BRIDGE</h3>
                         </div>
                         
                         <div class="space-y-6">
                             <div>
-                                <label class="text-[10px] font-bold text-slate-500 uppercase tracking-widest block mb-2">Webhook URL</label>
+                                <label class="text-[10px] font-bold text-slate-500 uppercase tracking-widest block mb-2">Webhook URL (Send to Discord)</label>
                                 <input id="webhook-input" type="text" value="${state.discordWebhook}" class="w-full bg-black border border-slate-800 p-4 rounded-xl text-xs text-indigo-300 outline-none focus:border-[#5865F2]" placeholder="https://discord.com/api/webhooks/...">
+                            </div>
+
+                            <div class="bg-black/40 border border-slate-800 p-6 rounded-2xl">
+                                <h4 class="text-xs font-bold text-[#5865F2] mb-3 uppercase tracking-tighter italic underline">How to text back?</h4>
+                                <p class="text-[11px] text-slate-400 leading-relaxed">
+                                    Webhooks are one-way. To receive Discord replies here, you must run a tiny "Bridge Bot". 
+                                    <br><br>
+                                    1. Go to <span class="text-indigo-400">Replit.com</span> or <span class="text-indigo-400">Glitch.com</span>
+                                    <br>
+                                    2. Create a script that listens to your Discord channel.
+                                    <br>
+                                    3. When a message is sent, have it write to your Firebase database with the field: 
+                                    <span class="text-white font-mono bg-slate-800 px-1 rounded">platform: "discord"</span>.
+                                </p>
                             </div>
 
                             <div class="flex justify-end gap-4 pt-4">
                                 <button onclick="closeModals()" class="text-slate-500 font-bold text-sm hover:text-white transition-colors">DISMISS</button>
-                                <button onclick="saveDiscordWebhook()" class="bg-[#5865F2] hover:bg-[#4752C4] px-8 py-3 rounded-xl font-black text-white text-sm transition-all">SAVE LINK</button>
+                                <button onclick="saveDiscordWebhook()" class="bg-[#5865F2] hover:bg-[#4752C4] px-8 py-3 rounded-xl font-black text-white text-sm transition-all shadow-xl shadow-[#5865F2]/20">SAVE LINK</button>
                             </div>
                         </div>
                     </div>
@@ -258,7 +328,7 @@
                 const isDiscord = m.platform === 'discord';
                 
                 return `
-                    <div class="flex flex-col ${isMe ? 'items-end' : 'items-start'} group animate-in fade-in slide-in-from-bottom-2 duration-300">
+                    <div class="flex flex-col ${isMe ? 'items-end' : 'items-start'} group">
                         <div class="flex items-center gap-2 mb-2 px-1">
                             ${isDiscord ? '<span class="bg-[#5865F2] text-[9px] font-black px-1.5 py-0.5 rounded text-white tracking-tighter">DISCORD</span>' : ''}
                             <span class="text-[10px] font-bold text-slate-500 uppercase tracking-widest">${m.senderName}</span>
