@@ -40,15 +40,10 @@
         } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // --- Configuration ---
-        const firebaseConfig = {
-            apiKey: "AIzaSyAkW6DI0jCMkOJY8t_txCntd5MhRed443w",
-            authDomain: "d-multiplayer-37078.firebaseapp.com",
-            projectId: "d-multiplayer-37078",
-            storageBucket: "d-multiplayer-37078.firebasestorage.app",
-            messagingSenderId: "1032442419330",
-            appId: "1:1032442419330:web:cfd110e8442febf829bc9b",
-            measurementId: "G-7KC04NRGE5"
-        };
+        // Configuration is securely injected by the environment
+        const firebaseConfig = typeof __firebase_config !== 'undefined' 
+            ? JSON.parse(__firebase_config) 
+            : {};
 
         const app = initializeApp(firebaseConfig);
         const auth = getAuth(app);
